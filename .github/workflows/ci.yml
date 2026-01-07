@@ -1,0 +1,161 @@
+name: React CI/CD Pipeline on GitHub Actions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  checks: write
+  contents: read
+  packages: write
+
+env:
+  IMAGE_TAG: 1.0.0
+  APP_PORT: 8085
+  APP_NAME: ${{ github.event.repository.name }}
+
+# ---------------------------------------------------
+# JOB 1 - SONARQUBE ANALYSIS
+# ---------------------------------------------------
+jobs:
+  sonar:
+    name: 🔎 SonarQube Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create reports directory
+        run: mkdir -p reports
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+        continue-on-error: true
+
+      - name: Run ESLint with JSON report
+        run: npm run lint:report
+        continue-on-error: true
+
+      - name: SonarQube Analysis
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Upload coverage to Codecov (optional)
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+      - name: Archive test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            coverage/
+            reports/
+
+# ---------------------------------------------------
+# JOB 2 - BUILD REACT APP (NO TESTS)
+# ---------------------------------------------------
+  build:
+    name: 🧱 Build React App
+    runs-on: ubuntu-latest
+    needs: sonar
+
+    steps:
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🧰 Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🧱 Build React app
+        run: npm run build
+
+# ---------------------------------------------------
+# JOB 3 - DOCKER BUILD & PUSH
+# ---------------------------------------------------
+  publish:
+    name: 🐳 Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔤 Normalize repo name to lowercase
+        run: echo "REPO_LOWERCASE=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: 🐳 Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: 🛠️ Build Docker image
+        run: docker build -t ghcr.io/$REPO_LOWERCASE:$IMAGE_TAG .
+
+      - name: 📤 Push Docker image
+        run: docker push ghcr.io/$REPO_LOWERCASE:$IMAGE_TAG
+
+# ---------------------------------------------------
+# JOB 4 - MANUAL DEPLOY
+# ---------------------------------------------------
+  deploy:
+    name: 🚀 Deploy to VPS (Manual Only)
+    runs-on: ubuntu-latest
+    needs: publish
+    # if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: 🔤 Normalize repo name to lowercase
+        run: echo "REPO_LOWERCASE=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: 📡 SSH Deploy to VPS
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          envs: REPO_LOWERCASE,IMAGE_TAG,APP_NAME,APP_PORT
+          script: |
+            echo "Déploiement React sur VPS..."
+
+            sudo docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
+            FULL_IMAGE="ghcr.io/$REPO_LOWERCASE:$IMAGE_TAG"
+            echo "Image : $FULL_IMAGE"
+
+            sudo docker pull $FULL_IMAGE
+
+            if sudo docker ps -a --format '{{.Names}}' | grep -q "^$APP_NAME$"; then
+              sudo docker stop $APP_NAME || true
+              sudo docker rm $APP_NAME || true
+            fi
+
+            sudo docker run -d --name $APP_NAME -p $APP_PORT:80 $FULL_IMAGE
+            echo "🚀 Déploiement terminé avec succès !"
+
